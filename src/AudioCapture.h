@@ -25,7 +25,9 @@ public:
     bool init(IMMDevice* dev, bool loopback);
     // Appends available audio to out. Returns false when the device died
     // (unplugged/invalidated) and the stream must be re-initialized.
-    bool pump(std::vector<int16_t>& out);
+    // Sets *discontinuity when WASAPI reports dropped data (a glitch), so the
+    // caller can resynchronize the two streams.
+    bool pump(std::vector<int16_t>& out, bool* discontinuity = nullptr);
     void shutdown();
     bool valid() const { return capture_ != nullptr; }
     ~AudioCaptureStream() { shutdown(); }
@@ -35,6 +37,7 @@ private:
 
     IAudioClient* client_ = nullptr;
     IAudioCaptureClient* capture_ = nullptr;
+    bool firstPacket_ = true; // WASAPI flags the very first packet as a discontinuity
     bool needConvert_ = false;
     int srcRate_ = 48000, srcCh_ = 2, srcBits_ = 16;
     bool srcFloat_ = false;

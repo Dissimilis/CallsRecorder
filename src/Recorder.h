@@ -35,7 +35,7 @@ private:
     std::wstring currentApp_;
     std::thread thread_;
 
-    float levels_[kLevelCount] = {};
+    std::atomic<float> levels_[kLevelCount] = {};
     std::atomic<unsigned> levelSeq_{0};
     float levelAccum_ = 0;
     size_t levelFrames_ = 0;

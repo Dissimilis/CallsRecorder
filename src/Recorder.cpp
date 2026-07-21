@@ -108,9 +108,12 @@ void Recorder::run(std::wstring folder) {
         wchar_t name[96];
         swprintf(name, 96, L"\\%04u-%02u-%02u %02u-%02u-%02u", st.wYear, st.wMonth,
                  st.wDay, st.wHour, st.wMinute, st.wSecond);
-        std::wstring path = folder + name;
-        if (cur.tracked) path += L" " + AppBaseName(cur.app);
-        path += L".mp3";
+        std::wstring base = folder + name;
+        if (cur.tracked) base += L" " + AppBaseName(cur.app);
+        // Timestamps have one-second resolution; never overwrite an existing file.
+        std::wstring path = base + L".mp3";
+        for (int n = 2; n < 100 && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; n++)
+            path = base + L" (" + std::to_wstring(n) + L").mp3";
         {
             std::lock_guard<std::mutex> lk(mtx_);
             currentFile_ = path;
@@ -119,6 +122,10 @@ void Recorder::run(std::wstring folder) {
 
         Mp3Writer writer;
         if (!writer.open(path)) {
+            // Shut streams down here: their destructors must not run after
+            // CoUninitialize below.
+            mic.shutdown();
+            loop.shutdown();
             running_ = false;
             en->Release();
             CoUninitialize();
@@ -146,9 +153,17 @@ void Recorder::run(std::wstring folder) {
 
         while (!stopFlag_ && !writeFailed) {
             Sleep(10);
-            bool err = false;
-            if (micOk && !mic.pump(micRing)) { micOk = false; err = true; }
+            bool err = false, micDisc = false;
+            if (micOk && !mic.pump(micRing, &micDisc)) { micOk = false; err = true; }
             if (loopOk && !loop.pump(loopRing)) { loopOk = false; err = true; }
+
+            // The mic drives the timeline, so if it dropped data the queued
+            // loopback audio now leads it. Discard the backlog to stay in sync.
+            if (micDisc && !loopRing.empty()) {
+                LogLine(L"Recorder: mic glitch, resyncing (%zu loopback frames dropped)",
+                        loopRing.size() / 2);
+                loopRing.clear();
+            }
 
             // A stream can be "open" yet deliver nothing (e.g. an idle
             // Bluetooth hands-free endpoint). Treat a mic silent for >1 s as
@@ -202,6 +217,22 @@ void Recorder::run(std::wstring folder) {
                     currentApp_ = np.app;
                 }
                 cur = np;
+            }
+        }
+
+        // Final drain: flush audio still queued in WASAPI and our rings so a
+        // stop doesn't drop the tail (up to ~1 s when the mic was starving).
+        if (!writeFailed) {
+            if (micOk) mic.pump(micRing);
+            if (loopOk) loop.pump(loopRing);
+            size_t mf = micRing.size() / 2, lf = loopRing.size() / 2;
+            size_t total = std::max(mf, lf);
+            if (total) {
+                mixBuf.resize(total * 2);
+                for (size_t i = 0; i < total; i++)
+                    mixFrame(&mixBuf[i * 2], i < mf ? &micRing[i * 2] : nullptr,
+                             i < lf ? &loopRing[i * 2] : nullptr);
+                writer.write(mixBuf.data(), total);
             }
         }
 

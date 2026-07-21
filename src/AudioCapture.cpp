@@ -95,6 +95,14 @@ bool AudioCaptureStream::init(IMMDevice* dev, bool loopback) {
         rs_.reset(srcRate_);
         LogLine(L"AudioCapture: manual convert path (%d Hz, %d ch, %d bit, float=%d)",
                 srcRate_, srcCh_, srcBits_, srcFloat_);
+        bool supported = (srcFloat_ && srcBits_ == 32) ||
+                         (!srcFloat_ && (srcBits_ == 16 || srcBits_ == 24 || srcBits_ == 32));
+        if (!supported) {
+            LogLine(L"AudioCapture: unsupported sample format (%d bit, float=%d) — refusing to record silence",
+                    srcBits_, srcFloat_);
+            shutdown();
+            return false;
+        }
     }
 
     hr = client_->GetService(__uuidof(IAudioCaptureClient), (void**)&capture_);
@@ -129,6 +137,15 @@ void AudioCaptureStream::toStereoFloat(const BYTE* data, UINT32 frames, std::vec
             const int32_t* s = (const int32_t*)data + (size_t)i * ch;
             l = (float)(s[0] / 2147483648.0);
             r = (float)((ch > 1 ? s[1] : s[0]) / 2147483648.0);
+        } else if (srcBits_ == 24) { // packed 24-bit PCM
+            auto s24 = [](const BYTE* p) {
+                int v = p[0] | (p[1] << 8) | (p[2] << 16);
+                if (v & 0x800000) v |= ~0xFFFFFF;
+                return (float)(v / 8388608.0);
+            };
+            const BYTE* p = data + (size_t)i * ch * 3;
+            l = s24(p);
+            r = ch > 1 ? s24(p + 3) : l;
         }
         out.push_back(l);
         out.push_back(r);
@@ -143,7 +160,7 @@ static void AppendInt16(const std::vector<float>& in, std::vector<int16_t>& out)
     }
 }
 
-bool AudioCaptureStream::pump(std::vector<int16_t>& out) {
+bool AudioCaptureStream::pump(std::vector<int16_t>& out, bool* discontinuity) {
     if (!capture_) return false;
     for (;;) {
         UINT32 pkt = 0;
@@ -156,6 +173,10 @@ bool AudioCaptureStream::pump(std::vector<int16_t>& out) {
         DWORD flags = 0;
         hr = capture_->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
         if (FAILED(hr)) return false;
+
+        if (discontinuity && (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && !firstPacket_)
+            *discontinuity = true;
+        firstPacket_ = false;
 
         if (frames) {
             bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
@@ -190,6 +211,7 @@ void AudioCaptureStream::shutdown() {
     if (client_) client_->Stop();
     SafeRelease(capture_);
     SafeRelease(client_);
+    firstPacket_ = true;
     needConvert_ = false;
     srcRate_ = 48000;
     srcCh_ = 2;

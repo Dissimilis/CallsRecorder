@@ -90,8 +90,12 @@ bool Mp3Writer::write(const int16_t* samples, size_t frames) {
 
 void Mp3Writer::close() {
     if (writer_) {
-        writer_->Finalize();
+        HRESULT hr = writer_->Finalize();
         SafeRelease(writer_);
-        LogLine(L"Mp3Writer: closed (%lld frames, %lld s)", framesWritten_, framesWritten_ / kRate);
+        if (FAILED(hr))
+            LogLine(L"Mp3Writer: Finalize FAILED hr=0x%08X — file may be truncated (%lld frames written)",
+                    hr, framesWritten_);
+        else
+            LogLine(L"Mp3Writer: closed (%lld frames, %lld s)", framesWritten_, framesWritten_ / kRate);
     }
 }

@@ -25,20 +25,24 @@ std::wstring Settings::GetStorageFolder() {
     return DefaultFolder();
 }
 
+// Pre-create the INI as UTF-16 so WritePrivateProfileStringW keeps Unicode
+// (a fresh INI would otherwise be ANSI and mangle non-ASCII folder paths).
+// Must run before EVERY write, since any write can be the one creating the file.
+static void EnsureUnicodeIni(const std::wstring& ini) {
+    if (GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    HANDLE h = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        const wchar_t bom[] = L"\xFEFF[main]\r\n";
+        DWORD written = 0;
+        WriteFile(h, bom, (DWORD)(wcslen(bom) * 2), &written, nullptr);
+        CloseHandle(h);
+    }
+}
+
 void Settings::SetStorageFolder(const std::wstring& folder) {
     std::wstring ini = IniPath();
-    // Pre-create as UTF-16 so WritePrivateProfileStringW keeps Unicode
-    // (a fresh INI would otherwise be ANSI and mangle non-ASCII paths).
-    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        HANDLE h = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            const wchar_t bom[] = L"\xFEFF[main]\r\n";
-            DWORD written = 0;
-            WriteFile(h, bom, (DWORD)(wcslen(bom) * 2), &written, nullptr);
-            CloseHandle(h);
-        }
-    }
+    EnsureUnicodeIni(ini);
     WritePrivateProfileStringW(L"main", L"folder", folder.c_str(), ini.c_str());
 }
 
@@ -47,7 +51,9 @@ static bool GetBool(const wchar_t* key, bool def) {
 }
 
 static void SetBool(const wchar_t* key, bool on) {
-    WritePrivateProfileStringW(L"main", key, on ? L"1" : L"0", IniPath().c_str());
+    std::wstring ini = IniPath();
+    EnsureUnicodeIni(ini);
+    WritePrivateProfileStringW(L"main", key, on ? L"1" : L"0", ini.c_str());
 }
 
 bool Settings::GetAutoRecord() { return GetBool(L"autoRecord", false); }
