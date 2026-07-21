@@ -33,6 +33,8 @@ bool Recorder::start(const std::wstring& folder) {
     running_ = true;
     startTick_ = GetTickCount64();
     levelSeq_ = 0;
+    levelAccum_ = 0;
+    levelFrames_ = 0;
     thread_ = std::thread(&Recorder::run, this, folder);
     return true;
 }
@@ -84,7 +86,9 @@ static std::wstring AppBaseName(const std::wstring& exe) {
 
 void Recorder::run(std::wstring folder) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    {
+    // An escaping exception would terminate the process and leave running_
+    // stuck true; log it and let the recording die cleanly instead.
+    try {
         IMMDeviceEnumerator* en = nullptr;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                     __uuidof(IMMDeviceEnumerator), (void**)&en))) {
@@ -114,6 +118,8 @@ void Recorder::run(std::wstring folder) {
         std::wstring path = base + L".mp3";
         for (int n = 2; n < 100 && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; n++)
             path = base + L" (" + std::to_wstring(n) + L").mp3";
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) // 99 collisions: last resort
+            path = base + L" " + std::to_wstring(GetTickCount64()) + L".mp3";
         {
             std::lock_guard<std::mutex> lk(mtx_);
             currentFile_ = path;
@@ -210,8 +216,10 @@ void Recorder::run(std::wstring folder) {
                 if (micChanged || loopChanged)
                     LogLine(L"Recorder: device change (tracked=%d app=%ls)",
                             np.tracked, np.app.empty() ? L"-" : np.app.c_str());
-                if (micChanged) micOk = OpenStream(en, mic, np.micId, false);
-                if (loopChanged) loopOk = OpenStream(en, loop, np.renderId, true);
+                // Drop frames queued from the old endpoints so we never mix
+                // stale old-device audio against the new streams.
+                if (micChanged) { micRing.clear(); micOk = OpenStream(en, mic, np.micId, false); }
+                if (loopChanged) { loopRing.clear(); loopOk = OpenStream(en, loop, np.renderId, true); }
                 if (np.tracked) {
                     std::lock_guard<std::mutex> lk(mtx_);
                     currentApp_ = np.app;
@@ -240,6 +248,10 @@ void Recorder::run(std::wstring folder) {
         loop.shutdown();
         writer.close();
         en->Release();
+    } catch (const std::exception& e) {
+        LogLine(L"Recorder: fatal exception: %hs", e.what());
+    } catch (...) {
+        LogLine(L"Recorder: fatal unknown exception");
     }
     running_ = false;
     CoUninitialize();

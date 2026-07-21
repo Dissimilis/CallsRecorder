@@ -38,12 +38,10 @@ void LogLine(const wchar_t* fmt, ...) {
     wchar_t stamped[1100];
     swprintf(stamped, 1100, L"%02u:%02u:%02u  %ls", st.wHour, st.wMinute, st.wSecond, msg);
 
-    {
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        g_logRing.push_back(stamped);
-        g_logCount++;
-        while (g_logRing.size() > kLogRingMax) g_logRing.pop_front();
-    }
+    std::lock_guard<std::mutex> lk(g_logMutex); // also serializes the file append
+    g_logRing.push_back(stamped);
+    g_logCount++;
+    while (g_logRing.size() > kLogRingMax) g_logRing.pop_front();
 
     std::wstring path = AppDataDir() + L"\\CallsRecorder.log";
     FILE* f = _wfopen(path.c_str(), L"a, ccs=UTF-8");

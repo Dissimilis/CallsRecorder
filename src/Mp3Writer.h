@@ -19,6 +19,8 @@ public:
     static const int kBytesPerSec = 16000; // 128 kbps
 
 private:
+    void abortOpen(const std::wstring& path);
+
     IMFSinkWriter* writer_ = nullptr;
     DWORD stream_ = 0;
     long long framesWritten_ = 0;

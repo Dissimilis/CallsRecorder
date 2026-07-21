@@ -4,6 +4,13 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 
+// Failed half-way through open: drop the writer without Finalize and remove
+// the empty file the sink already created on disk.
+void Mp3Writer::abortOpen(const std::wstring& path) {
+    SafeRelease(writer_);
+    DeleteFileW(path.c_str());
+}
+
 bool Mp3Writer::open(const std::wstring& path) {
     close();
     framesWritten_ = 0;
@@ -15,7 +22,12 @@ bool Mp3Writer::open(const std::wstring& path) {
     }
 
     IMFMediaType* out = nullptr;
-    MFCreateMediaType(&out);
+    hr = MFCreateMediaType(&out);
+    if (FAILED(hr) || !out) {
+        LogLine(L"Mp3Writer: MFCreateMediaType(out) failed hr=0x%08X", hr);
+        abortOpen(path);
+        return false;
+    }
     out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     out->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_MP3);
     out->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kChannels);
@@ -25,12 +37,17 @@ bool Mp3Writer::open(const std::wstring& path) {
     SafeRelease(out);
     if (FAILED(hr)) {
         LogLine(L"Mp3Writer: AddStream failed hr=0x%08X", hr);
-        close();
+        abortOpen(path);
         return false;
     }
 
     IMFMediaType* in = nullptr;
-    MFCreateMediaType(&in);
+    hr = MFCreateMediaType(&in);
+    if (FAILED(hr) || !in) {
+        LogLine(L"Mp3Writer: MFCreateMediaType(in) failed hr=0x%08X", hr);
+        abortOpen(path);
+        return false;
+    }
     in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     in->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
     in->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kChannels);
@@ -43,14 +60,14 @@ bool Mp3Writer::open(const std::wstring& path) {
     SafeRelease(in);
     if (FAILED(hr)) {
         LogLine(L"Mp3Writer: SetInputMediaType failed hr=0x%08X", hr);
-        close();
+        abortOpen(path);
         return false;
     }
 
     hr = writer_->BeginWriting();
     if (FAILED(hr)) {
         LogLine(L"Mp3Writer: BeginWriting failed hr=0x%08X", hr);
-        close();
+        abortOpen(path);
         return false;
     }
     LogLine(L"Mp3Writer: opened %ls", path.c_str());
@@ -66,7 +83,11 @@ bool Mp3Writer::write(const int16_t* samples, size_t frames) {
     if (FAILED(hr)) return false;
 
     BYTE* dst = nullptr;
-    buf->Lock(&dst, nullptr, nullptr);
+    hr = buf->Lock(&dst, nullptr, nullptr);
+    if (FAILED(hr) || !dst) {
+        SafeRelease(buf);
+        return false;
+    }
     memcpy(dst, samples, bytes);
     buf->Unlock();
     buf->SetCurrentLength(bytes);
