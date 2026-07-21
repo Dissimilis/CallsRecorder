@@ -10,9 +10,17 @@ Run `CallsRecorder.exe`. A small ring icon appears in the tray.
 
 The exe is not code-signed, so Windows SmartScreen will complain the first time you run a downloaded copy. Click "More info", then "Run anyway", or build it from source yourself (see below).
 
-Right-click it for the menu (start/stop, open recordings folder, change folder, exit), or just double-click the icon to toggle recording. While recording, the icon turns into a red dot and the tooltip shows elapsed time.
+Right-click it for the menu, or just double-click the icon to toggle recording. While recording, the icon turns into a red dot and the tooltip shows elapsed time.
 
-Recordings go to your Downloads folder by default, named like `2026-07-21 14-32-05.mp3`. You can pick a different folder from the menu and it will be remembered.
+Recordings go to your Downloads folder by default, named like `2026-07-21 14-32-05 teams.mp3` (the call app's name is included when one was detected). You can pick a different folder from the menu and it will be remembered.
+
+The menu also has a few toggles:
+
+- **Auto-record calls.** The app watches for a call app grabbing the microphone and starts recording by itself, then stops a few seconds after the call ends. Stopping a recording manually mid-call won't restart it; the next call arms it again. Off by default.
+- **Separate channels.** Your mic goes to the left channel and the call audio to the right, instead of both being mixed. Odd for listening, great for feeding recordings to transcription tools that want speakers separated. Off by default (mixed).
+- **Start with Windows.** Adds the app to your login startup. Pairs well with auto-record: set both once and every call just gets recorded.
+
+There's also a debug window in the menu showing recording status, elapsed time, a live level waveform (handy to confirm sound is actually being captured), and the recent log.
 
 ## The interesting part: device selection
 

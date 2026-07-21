@@ -1,21 +1,38 @@
 #include "common.h"
 #include "Recorder.h"
 #include "DeviceTracker.h"
+#include "DebugWindow.h"
 #include "Settings.h"
 #include <mfapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <atomic>
+#include <thread>
 #include <cmath>
 
 static const UINT WM_TRAYICON = WM_APP + 1;
+static const UINT WM_AUTOCMD = WM_APP + 2; // wParam: 1 = auto-start, 0 = auto-stop
 static const UINT kTimerId = 1;
-enum MenuId { kMenuStatus = 1, kMenuToggle, kMenuOpenFolder, kMenuChooseFolder, kMenuExit };
+enum MenuId {
+    kMenuStatus = 1, kMenuToggle, kMenuAuto, kMenuSplit, kMenuStartup,
+    kMenuOpenFolder, kMenuChooseFolder, kMenuDebug, kMenuExit
+};
 
 static HWND g_hwnd;
+static HINSTANCE g_inst;
 static Recorder g_recorder;
 static HICON g_iconIdle, g_iconRec;
 static UINT g_taskbarCreatedMsg;
+
+// Auto-record watcher state
+static std::thread g_watcher;
+static std::atomic<bool> g_watcherStop{false};
+static std::atomic<bool> g_autoEnabled{false};
+static std::atomic<bool> g_autoStartedRec{false};
+// After a stop, wait until no call is detected before auto-starting again,
+// so stopping manually mid-call doesn't immediately restart the recording.
+static std::atomic<bool> g_rearm{false};
 
 // 32x32 icon drawn in code: hollow ring when idle, solid red dot when recording.
 static HICON MakeDotIcon(COLORREF color, bool solid) {
@@ -87,21 +104,23 @@ static void UpdateTrayIcon(bool add) {
     Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &nid);
 }
 
-static void StartRecording() {
+static void StartRecording(bool autoStarted) {
     if (g_recorder.recording()) return;
     if (g_recorder.start(Settings::GetStorageFolder())) {
+        g_autoStartedRec = autoStarted;
         SetTimer(g_hwnd, kTimerId, 1000, nullptr);
         UpdateTrayIcon(false);
-        LogLine(L"UI: recording started -> %ls", g_recorder.currentFile().c_str());
+        LogLine(L"UI: recording started (%ls)", autoStarted ? L"auto" : L"manual");
     }
 }
 
-static void StopRecording() {
+static void StopRecording(bool autoStopped) {
     if (!g_recorder.recording()) return;
     g_recorder.stop();
+    g_rearm = true; // don't auto-restart until the current call ends
     KillTimer(g_hwnd, kTimerId);
     UpdateTrayIcon(false);
-    LogLine(L"UI: recording stopped");
+    LogLine(L"UI: recording stopped (%ls)", autoStopped ? L"auto" : L"manual");
 }
 
 static void ChooseFolder() {
@@ -134,20 +153,115 @@ static void OpenFolder() {
     ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static bool GetStartWithWindows() {
+    wchar_t buf[MAX_PATH * 2];
+    DWORD sz = sizeof(buf);
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"CallsRecorder",
+                        RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS;
+}
+
+static void SetStartWithWindows(bool on) {
+    if (on) {
+        wchar_t exe[MAX_PATH * 2];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+        std::wstring v = L"\"" + std::wstring(exe) + L"\"";
+        RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, L"CallsRecorder", REG_SZ,
+                        v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, L"CallsRecorder");
+    }
+    LogLine(L"UI: start with Windows -> %d", on);
+}
+
+// Polls for call-app audio sessions and asks the UI thread to start/stop.
+static void AutoWatcher() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int missCount = 0;
+    while (!g_watcherStop) {
+        for (int i = 0; i < 30 && !g_watcherStop; i++) Sleep(100);
+        if (g_watcherStop) break;
+        if (!g_autoEnabled) { missCount = 0; continue; }
+
+        DevicePick p = DeviceTracker::Pick();
+        if (!g_recorder.recording()) {
+            missCount = 0;
+            if (!p.tracked)
+                g_rearm = false;
+            else if (!g_rearm)
+                PostMessageW(g_hwnd, WM_AUTOCMD, 1, 0);
+        } else if (g_autoStartedRec) {
+            if (!p.tracked) {
+                if (++missCount >= 2) { // ~6 s of no call before stopping
+                    missCount = 0;
+                    PostMessageW(g_hwnd, WM_AUTOCMD, 0, 0);
+                }
+            } else {
+                missCount = 0;
+            }
+        }
+    }
+    CoUninitialize();
+}
+
+static void DoCommand(UINT cmd) {
+    switch (cmd) {
+        case kMenuToggle:
+            if (g_recorder.recording()) StopRecording(false);
+            else StartRecording(false);
+            break;
+        case kMenuAuto: {
+            bool on = !Settings::GetAutoRecord();
+            Settings::SetAutoRecord(on);
+            g_autoEnabled = on;
+            g_rearm = false;
+            LogLine(L"UI: auto-record -> %d", on);
+            break;
+        }
+        case kMenuSplit: {
+            bool on = !Settings::GetSplitChannels();
+            Settings::SetSplitChannels(on);
+            LogLine(L"UI: split channels -> %d (applies to next recording)", on);
+            break;
+        }
+        case kMenuStartup:
+            SetStartWithWindows(!GetStartWithWindows());
+            break;
+        case kMenuOpenFolder: OpenFolder(); break;
+        case kMenuChooseFolder: ChooseFolder(); break;
+        case kMenuDebug: DebugWindow_Show(g_inst, &g_recorder); break;
+        case kMenuExit:
+            StopRecording(false);
+            DestroyWindow(g_hwnd);
+            break;
+    }
+}
+
 static void ShowMenu() {
     HMENU menu = CreatePopupMenu();
     if (g_recorder.recording()) {
-        wchar_t t[32], status[64];
+        wchar_t t[32], status[80];
         FormatElapsed(t, 32);
-        swprintf(status, 64, L"● Recording  %ls", t);
+        std::wstring app = g_recorder.currentApp();
+        swprintf(status, 80, L"● Recording  %ls%ls%ls", t,
+                 app.empty() ? L"" : L"  ", app.c_str());
         AppendMenuW(menu, MF_STRING | MF_GRAYED, kMenuStatus, status);
         AppendMenuW(menu, MF_STRING, kMenuToggle, L"Stop recording");
     } else {
         AppendMenuW(menu, MF_STRING, kMenuToggle, L"Start recording");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (Settings::GetAutoRecord() ? MF_CHECKED : 0),
+                kMenuAuto, L"Auto-record calls");
+    AppendMenuW(menu, MF_STRING | (Settings::GetSplitChannels() ? MF_CHECKED : 0),
+                kMenuSplit, L"Separate channels (mic left, call right)");
+    AppendMenuW(menu, MF_STRING | (GetStartWithWindows() ? MF_CHECKED : 0),
+                kMenuStartup, L"Start with Windows");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Open recordings folder");
     AppendMenuW(menu, MF_STRING, kMenuChooseFolder, L"Choose storage folder…");
+    AppendMenuW(menu, MF_STRING, kMenuDebug, L"Debug window");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
 
@@ -156,19 +270,7 @@ static void ShowMenu() {
     SetForegroundWindow(g_hwnd); // required so the menu closes on outside click
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_hwnd, nullptr);
     DestroyMenu(menu);
-
-    switch (cmd) {
-        case kMenuToggle:
-            if (g_recorder.recording()) StopRecording();
-            else StartRecording();
-            break;
-        case kMenuOpenFolder: OpenFolder(); break;
-        case kMenuChooseFolder: ChooseFolder(); break;
-        case kMenuExit:
-            StopRecording();
-            DestroyWindow(g_hwnd);
-            break;
-    }
+    if (cmd) DoCommand(cmd);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -180,10 +282,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TRAYICON:
             if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
                 ShowMenu();
-            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
-                if (g_recorder.recording()) StopRecording();
-                else StartRecording();
-            }
+            else if (LOWORD(lp) == WM_LBUTTONDBLCLK)
+                DoCommand(kMenuToggle);
+            return 0;
+        case WM_COMMAND:
+            DoCommand(LOWORD(wp));
+            return 0;
+        case WM_AUTOCMD:
+            if (wp == 1) StartRecording(true);
+            else StopRecording(true);
             return 0;
         case WM_TIMER:
             if (wp == kTimerId) {
@@ -245,6 +352,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     MFStartup(MF_VERSION);
     LogLine(L"App: started");
 
+    g_inst = hInst;
     g_iconIdle = MakeDotIcon(RGB(110, 130, 150), false);
     g_iconRec = MakeDotIcon(RGB(225, 45, 45), true);
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
@@ -258,12 +366,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
                            HWND_MESSAGE, nullptr, hInst, nullptr);
     UpdateTrayIcon(true);
 
+    g_autoEnabled = Settings::GetAutoRecord();
+    g_watcher = std::thread(AutoWatcher);
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    g_watcherStop = true;
+    if (g_watcher.joinable()) g_watcher.join();
     g_recorder.stop();
     MFShutdown();
     CoUninitialize();

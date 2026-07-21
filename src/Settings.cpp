@@ -41,3 +41,17 @@ void Settings::SetStorageFolder(const std::wstring& folder) {
     }
     WritePrivateProfileStringW(L"main", L"folder", folder.c_str(), ini.c_str());
 }
+
+static bool GetBool(const wchar_t* key, bool def) {
+    return GetPrivateProfileIntW(L"main", key, def ? 1 : 0, IniPath().c_str()) != 0;
+}
+
+static void SetBool(const wchar_t* key, bool on) {
+    WritePrivateProfileStringW(L"main", key, on ? L"1" : L"0", IniPath().c_str());
+}
+
+bool Settings::GetAutoRecord() { return GetBool(L"autoRecord", false); }
+void Settings::SetAutoRecord(bool on) { SetBool(L"autoRecord", on); }
+
+bool Settings::GetSplitChannels() { return GetBool(L"splitChannels", false); }
+void Settings::SetSplitChannels(bool on) { SetBool(L"splitChannels", on); }

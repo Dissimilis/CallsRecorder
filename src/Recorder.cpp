@@ -2,6 +2,7 @@
 #include "AudioCapture.h"
 #include "DeviceTracker.h"
 #include "Mp3Writer.h"
+#include "Settings.h"
 #include <mmdeviceapi.h>
 #include <shlobj.h>
 #include <algorithm>
@@ -9,6 +10,7 @@
 
 static const size_t kMaxLoopBacklogFrames = 48000; // 1 s
 static const size_t kTrimLoopToFrames = 9600;      // 200 ms
+static const size_t kLevelBlockFrames = 2400;      // one waveform level per 50 ms
 
 static bool OpenStream(IMMDeviceEnumerator* en, AudioCaptureStream& stream,
                        const std::wstring& id, bool loopback) {
@@ -27,17 +29,11 @@ bool Recorder::start(const std::wstring& folder) {
 
     SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
 
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t name[64];
-    swprintf(name, 64, L"\\%04u-%02u-%02u %02u-%02u-%02u.mp3",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    currentFile_ = folder + name;
-
     stopFlag_ = false;
     running_ = true;
     startTick_ = GetTickCount64();
-    thread_ = std::thread(&Recorder::run, this, currentFile_);
+    levelSeq_ = 0;
+    thread_ = std::thread(&Recorder::run, this, folder);
     return true;
 }
 
@@ -47,7 +43,46 @@ void Recorder::stop() {
     running_ = false;
 }
 
-void Recorder::run(std::wstring path) {
+std::wstring Recorder::currentFile() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return currentFile_;
+}
+
+std::wstring Recorder::currentApp() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return currentApp_;
+}
+
+size_t Recorder::levelHistory(float* out, size_t maxN) const {
+    unsigned seq = levelSeq_;
+    size_t n = std::min((size_t)seq, std::min(maxN, kLevelCount));
+    for (size_t i = 0; i < n; i++)
+        out[i] = levels_[(seq - n + i) % kLevelCount];
+    return n;
+}
+
+void Recorder::pushLevel(const int16_t* samples, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        float v = (float)(samples[i] < 0 ? -samples[i] : samples[i]) / 32768.0f;
+        if (v > levelAccum_) levelAccum_ = v;
+    }
+    levelFrames_ += count / 2;
+    if (levelFrames_ >= kLevelBlockFrames) {
+        unsigned seq = levelSeq_;
+        levels_[seq % kLevelCount] = levelAccum_;
+        levelSeq_ = seq + 1;
+        levelAccum_ = 0;
+        levelFrames_ = 0;
+    }
+}
+
+// Strips ".exe" for use in a file name ("zoom.exe" -> "zoom").
+static std::wstring AppBaseName(const std::wstring& exe) {
+    size_t dot = exe.rfind(L'.');
+    return dot == std::wstring::npos ? exe : exe.substr(0, dot);
+}
+
+void Recorder::run(std::wstring folder) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         IMMDeviceEnumerator* en = nullptr;
@@ -59,6 +94,29 @@ void Recorder::run(std::wstring path) {
             return;
         }
 
+        bool split = Settings::GetSplitChannels();
+
+        AudioCaptureStream mic, loop;
+        DevicePick cur = DeviceTracker::Pick();
+        bool micOk = OpenStream(en, mic, cur.micId, false);
+        bool loopOk = OpenStream(en, loop, cur.renderId, true);
+
+        // File name carries the call app when one was detected:
+        // "2026-07-21 14-32-05 teams.mp3".
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t name[96];
+        swprintf(name, 96, L"\\%04u-%02u-%02u %02u-%02u-%02u", st.wYear, st.wMonth,
+                 st.wDay, st.wHour, st.wMinute, st.wSecond);
+        std::wstring path = folder + name;
+        if (cur.tracked) path += L" " + AppBaseName(cur.app);
+        path += L".mp3";
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            currentFile_ = path;
+            currentApp_ = cur.tracked ? cur.app : L"";
+        }
+
         Mp3Writer writer;
         if (!writer.open(path)) {
             running_ = false;
@@ -66,18 +124,25 @@ void Recorder::run(std::wstring path) {
             CoUninitialize();
             return;
         }
-
-        AudioCaptureStream mic, loop;
-        DevicePick cur = DeviceTracker::Pick();
-        bool micOk = OpenStream(en, mic, cur.micId, false);
-        bool loopOk = OpenStream(en, loop, cur.renderId, true);
-        LogLine(L"Recorder: start mic=%d loop=%d tracked=%d app=%ls",
-                micOk, loopOk, cur.tracked, cur.app.empty() ? L"-" : cur.app.c_str());
+        LogLine(L"Recorder: start mic=%d loop=%d tracked=%d app=%ls split=%d",
+                micOk, loopOk, cur.tracked, cur.app.empty() ? L"-" : cur.app.c_str(), split);
 
         std::vector<int16_t> micRing, loopRing, mixBuf;
         int tick = 0;
         int micStarvedTicks = 0;
         bool writeFailed = false;
+
+        auto mixFrame = [split](int16_t* out, const int16_t* m, const int16_t* l) {
+            if (split) {
+                out[0] = m ? (int16_t)(((int)m[0] + m[1]) / 2) : 0;
+                out[1] = l ? (int16_t)(((int)l[0] + l[1]) / 2) : 0;
+            } else {
+                int a = (m ? m[0] : 0) + (l ? l[0] : 0);
+                int b = (m ? m[1] : 0) + (l ? l[1] : 0);
+                out[0] = (int16_t)std::clamp(a, -32768, 32767);
+                out[1] = (int16_t)std::clamp(b, -32768, 32767);
+            }
+        };
 
         while (!stopFlag_ && !writeFailed) {
             Sleep(10);
@@ -96,7 +161,11 @@ void Recorder::run(std::wstring path) {
             // still gets recorded.
             if (!micAlive && !loopRing.empty()) {
                 size_t lf = loopRing.size() / 2;
-                if (!writer.write(loopRing.data(), lf)) writeFailed = true;
+                mixBuf.resize(lf * 2);
+                for (size_t i = 0; i < lf; i++)
+                    mixFrame(&mixBuf[i * 2], nullptr, &loopRing[i * 2]);
+                if (!writer.write(mixBuf.data(), lf)) writeFailed = true;
+                pushLevel(mixBuf.data(), mixBuf.size());
                 loopRing.clear();
                 micRing.clear();
             }
@@ -104,11 +173,11 @@ void Recorder::run(std::wstring path) {
             if (frames) {
                 size_t lf = std::min(frames, loopRing.size() / 2);
                 mixBuf.resize(frames * 2);
-                for (size_t i = 0; i < frames * 2; i++) {
-                    int v = micRing[i] + (i < lf * 2 ? loopRing[i] : 0);
-                    mixBuf[i] = (int16_t)std::clamp(v, -32768, 32767);
-                }
+                for (size_t i = 0; i < frames; i++)
+                    mixFrame(&mixBuf[i * 2], &micRing[i * 2],
+                             i < lf ? &loopRing[i * 2] : nullptr);
                 if (!writer.write(mixBuf.data(), frames)) writeFailed = true;
+                pushLevel(mixBuf.data(), mixBuf.size());
                 micRing.clear();
                 loopRing.erase(loopRing.begin(), loopRing.begin() + lf * 2);
             }
@@ -128,6 +197,10 @@ void Recorder::run(std::wstring path) {
                             np.tracked, np.app.empty() ? L"-" : np.app.c_str());
                 if (micChanged) micOk = OpenStream(en, mic, np.micId, false);
                 if (loopChanged) loopOk = OpenStream(en, loop, np.renderId, true);
+                if (np.tracked) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    currentApp_ = np.app;
+                }
                 cur = np;
             }
         }
