@@ -1,21 +1,26 @@
 #include "common.h"
 #include "Recorder.h"
 #include "DeviceTracker.h"
+#include "CallDetector.h"
 #include "DebugWindow.h"
 #include "Settings.h"
 #include <mfapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <cmath>
 
 static const UINT WM_TRAYICON = WM_APP + 1;
-static const UINT WM_AUTOCMD = WM_APP + 2; // wParam: 1 = auto-start, 0 = auto-stop
+static const UINT WM_AUTOCMD = WM_APP + 2; // wParam: 1 = auto-start, 0 = auto-stop,
+                                           //         2 = "meeting over?" prompt, 3 = cancel prompt
+                                           // lParam: detector generation at decision time
 static const UINT kTimerId = 1;
 enum MenuId {
-    kMenuStatus = 1, kMenuToggle, kMenuAuto, kMenuSplit, kMenuStartup,
+    kMenuStatus = 1, kMenuToggle, kMenuExtend, kMenuAuto, kMenuSplit, kMenuStartup,
     kMenuOpenFolder, kMenuChooseFolder, kMenuDebug, kMenuExit
 };
 
@@ -30,9 +35,9 @@ static std::thread g_watcher;
 static std::atomic<bool> g_watcherStop{false};
 static std::atomic<bool> g_autoEnabled{false};
 static std::atomic<bool> g_autoStartedRec{false};
-// After a stop, wait until no call is detected before auto-starting again,
-// so stopping manually mid-call doesn't immediately restart the recording.
-static std::atomic<bool> g_rearm{false};
+static std::atomic<bool> g_promptShown{false};
+static CallDetector g_detector; // ticked by the watcher thread; UI thread calls extend()/reset()
+static std::mutex g_detectorMtx;
 
 // 32x32 icon drawn in code: hollow ring when idle, solid red dot when recording.
 static HICON MakeDotIcon(COLORREF color, bool solid) {
@@ -114,13 +119,54 @@ static void StartRecording(bool autoStarted) {
     }
 }
 
+static void ShowEndPrompt(bool show);
+static void ExtendRecording();
+
 static void StopRecording(bool autoStopped) {
     if (!g_recorder.recording()) return;
     g_recorder.stop();
-    g_rearm = true; // don't auto-restart until the current call ends
+    if (!autoStopped) { // don't auto-restart until the current call ends
+        std::lock_guard<std::mutex> lk(g_detectorMtx);
+        g_detector.manualStop();
+    }
     KillTimer(g_hwnd, kTimerId);
     UpdateTrayIcon(false);
+    if (g_promptShown) ShowEndPrompt(false); // don't leave a stale "meeting over?" up
     LogLine(L"UI: recording stopped (%ls)", autoStopped ? L"auto" : L"manual");
+}
+
+// Balloon: "looks like the meeting ended; click to keep recording".
+static void ShowEndPrompt(bool show) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    if (show) {
+        wcscpy(nid.szInfoTitle, L"Meeting over?");
+        wcscpy(nid.szInfo, L"Recording stops in 1 minute. Click here to keep recording "
+                           L"(or use the tray menu).");
+    }
+    // Empty szInfo removes a balloon that is still showing.
+    BOOL ok = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    g_promptShown = show && ok;
+    LogLine(L"UI: meeting-over balloon %ls (ok=%d)", show ? L"shown" : L"dismissed", ok);
+    if (show && !ok) {
+        // Couldn't ask the user, so don't run the countdown either.
+        LogLine(L"UI: balloon failed; keeping the recording");
+        ExtendRecording();
+    }
+}
+
+static void ExtendRecording() {
+    if (!g_recorder.recording()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_detectorMtx);
+        g_detector.extend(GetTickCount64());
+    }
+    if (g_promptShown) ShowEndPrompt(false);
+    LogLine(L"UI: keep recording (extended 15 min)");
 }
 
 static void ChooseFolder() {
@@ -175,31 +221,65 @@ static void SetStartWithWindows(bool on) {
     LogLine(L"UI: start with Windows -> %d", on);
 }
 
-// Polls for call-app audio sessions and asks the UI thread to start/stop.
+// Polls call-app audio sessions once a second, feeds the detector and asks
+// the UI thread to start/stop/prompt. Logs a signal summary every 30 s while
+// auto-record is on (and on every decision) for diagnosing app behaviour.
 static void AutoWatcher() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    int missCount = 0;
+    int logTick = 0;
     while (!g_watcherStop) {
-        for (int i = 0; i < 30 && !g_watcherStop; i++) Sleep(100);
+        for (int i = 0; i < 10 && !g_watcherStop; i++) Sleep(100);
         if (g_watcherStop) break;
-        if (!g_autoEnabled) { missCount = 0; continue; }
+        if (!g_autoEnabled) { logTick = 0; continue; }
 
-        DevicePick p = DeviceTracker::Pick();
-        if (!g_recorder.recording()) {
-            missCount = 0;
-            if (!p.tracked)
-                g_rearm = false;
-            else if (!g_rearm)
-                PostMessageW(g_hwnd, WM_AUTOCMD, 1, 0);
-        } else if (g_autoStartedRec) {
-            if (!p.tracked) {
-                if (++missCount >= 2) { // ~6 s of no call before stopping
-                    missCount = 0;
-                    PostMessageW(g_hwnd, WM_AUTOCMD, 0, 0);
-                }
-            } else {
-                missCount = 0;
-            }
+        CallProbe c = DeviceTracker::Probe();
+        CallDetector::Input in;
+        in.nowMs = GetTickCount64();
+        in.valid = c.valid;
+        in.recording = g_recorder.recording();
+        in.autoStarted = g_autoStartedRec;
+        in.micActive = c.micActive;
+        in.renderActive = c.renderActive;
+        in.renderPeak = c.renderPeak;
+        in.meetingWindow = c.meetingWindow;
+        if (in.recording) { // recorder's own peak over the last ~2 s
+            float lv[40];
+            size_t n = g_recorder.levelHistory(lv, 40);
+            float mx = 0;
+            for (size_t i = 0; i < n; i++) mx = std::max(mx, lv[i]);
+            in.recLevel = mx;
+        }
+
+        CallDetector::Action a;
+        bool pending;
+        const wchar_t* reason;
+        unsigned gen;
+        {
+            std::lock_guard<std::mutex> lk(g_detectorMtx);
+            a = g_detector.tick(in);
+            pending = g_detector.promptPending();
+            reason = g_detector.reason();
+            gen = g_detector.generation();
+        }
+        bool decided = a != CallDetector::Action::None;
+        if (decided || ++logTick >= 30) {
+            logTick = 0;
+            const wchar_t* name =
+                a == CallDetector::Action::Start ? L" -> START" :
+                a == CallDetector::Action::Stop ? L" -> STOP" :
+                a == CallDetector::Action::PromptEnd ? L" -> PROMPT" :
+                a == CallDetector::Action::CancelPrompt ? L" -> CANCEL" : L"";
+            LogLine(L"Detect: app=%ls mic=%d micPk=%.3f render=%d renderPk=%.3f win=%d rec=%d recLv=%.3f prompt=%d%ls%ls%ls",
+                    c.app.empty() ? L"-" : c.app.c_str(), c.micActive, c.micPeak,
+                    c.renderActive, c.renderPeak, c.meetingWindow, in.recording,
+                    in.recLevel, pending, name, decided ? L": " : L"", decided ? reason : L"");
+        }
+        switch (a) {
+            case CallDetector::Action::Start: PostMessageW(g_hwnd, WM_AUTOCMD, 1, (LPARAM)gen); break;
+            case CallDetector::Action::Stop: PostMessageW(g_hwnd, WM_AUTOCMD, 0, (LPARAM)gen); break;
+            case CallDetector::Action::PromptEnd: PostMessageW(g_hwnd, WM_AUTOCMD, 2, (LPARAM)gen); break;
+            case CallDetector::Action::CancelPrompt: PostMessageW(g_hwnd, WM_AUTOCMD, 3, (LPARAM)gen); break;
+            default: break;
         }
     }
     CoUninitialize();
@@ -211,11 +291,16 @@ static void DoCommand(UINT cmd) {
             if (g_recorder.recording()) StopRecording(false);
             else StartRecording(false);
             break;
+        case kMenuExtend: ExtendRecording(); break;
         case kMenuAuto: {
             bool on = !Settings::GetAutoRecord();
             Settings::SetAutoRecord(on);
             g_autoEnabled = on;
-            g_rearm = false;
+            {
+                std::lock_guard<std::mutex> lk(g_detectorMtx);
+                g_detector.reset();
+            }
+            if (g_promptShown) ShowEndPrompt(false);
             LogLine(L"UI: auto-record -> %d", on);
             break;
         }
@@ -248,6 +333,10 @@ static void ShowMenu() {
                  app.empty() ? L"" : L"  ", app.c_str());
         AppendMenuW(menu, MF_STRING | MF_GRAYED, kMenuStatus, status);
         AppendMenuW(menu, MF_STRING, kMenuToggle, L"Stop recording");
+        if (g_autoStartedRec)
+            AppendMenuW(menu, MF_STRING, kMenuExtend,
+                        g_promptShown ? L"Keep recording — meeting is not over"
+                                      : L"Keep recording 15 more minutes");
     } else {
         AppendMenuW(menu, MF_STRING, kMenuToggle, L"Start recording");
     }
@@ -284,14 +373,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ShowMenu();
             else if (LOWORD(lp) == WM_LBUTTONDBLCLK)
                 DoCommand(kMenuToggle);
+            else if (LOWORD(lp) == NIN_BALLOONUSERCLICK)
+                ExtendRecording();
+            else if (LOWORD(lp) == NIN_BALLOONTIMEOUT)
+                g_promptShown = false;
             return 0;
         case WM_COMMAND:
             DoCommand(LOWORD(wp));
             return 0;
-        case WM_AUTOCMD:
-            if (wp == 1) StartRecording(true);
-            else StopRecording(true);
+        case WM_AUTOCMD: {
+            // The watcher decided a moment ago; if the user extended, toggled
+            // auto-record or stopped manually since, the command is stale.
+            if (!g_autoEnabled) return 0;
+            unsigned gen;
+            {
+                std::lock_guard<std::mutex> lk(g_detectorMtx);
+                gen = g_detector.generation();
+            }
+            if ((unsigned)lp != gen) {
+                LogLine(L"UI: ignoring stale auto command %u (gen %u != %u)",
+                        (unsigned)wp, (unsigned)lp, gen);
+                return 0;
+            }
+            switch (wp) {
+                case 1: StartRecording(true); break;
+                case 0: StopRecording(true); break;
+                case 2: ShowEndPrompt(true); break;
+                case 3: ShowEndPrompt(false); break;
+            }
             return 0;
+        }
         case WM_TIMER:
             if (wp == kTimerId) {
                 // Recorder thread may have died (e.g. disk full) — reflect it.
@@ -323,6 +434,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
         LogLine(L"Devices: tracked=%d app=%ls\n  mic=%ls\n  render=%ls",
                 p.tracked, p.app.empty() ? L"-" : p.app.c_str(),
                 p.micId.c_str(), p.renderId.c_str());
+        CallProbe c = DeviceTracker::Probe();
+        LogLine(L"Probe: app=%ls mic=%d micPk=%.3f render=%d renderPk=%.3f win=%d",
+                c.app.empty() ? L"-" : c.app.c_str(), c.micActive, c.micPeak,
+                c.renderActive, c.renderPeak, c.meetingWindow);
         CoUninitialize();
         return 0;
     }

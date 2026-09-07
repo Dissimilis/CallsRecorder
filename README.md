@@ -16,7 +16,7 @@ Recordings go to your Downloads folder by default, named like `2026-07-21 14-32-
 
 The menu also has a few toggles:
 
-- **Auto-record calls.** The app watches for a call app grabbing the microphone and starts recording by itself, then stops a few seconds after the call ends. Stopping a recording manually mid-call won't restart it; the next call arms it again. Off by default.
+- **Auto-record calls.** The app watches for a call app (Teams, Zoom, browsers for Meet, and others) grabbing the microphone and starts recording right away. It is deliberately biased towards recording too much rather than cutting a call short: it stops only once the app has let go of the microphone for 15 seconds. Some apps keep the microphone open after you hang up, so if the microphone is still held but nothing has been heard in either direction for two minutes (or Zoom's meeting window is gone), a tray balloon asks "Meeting over?" and stops after another minute unless you click it. Clicking the balloon, or picking **Keep recording** from the menu, buys another 15 minutes. Stopping a recording manually mid-call won't restart it; the next call arms it again. Off by default.
 - **Separate channels.** Your mic goes to the left channel and the call audio to the right, instead of both being mixed. Odd for listening, great for feeding recordings to transcription tools that want speakers separated. Off by default (mixed).
 - **Start with Windows.** Adds the app to your login startup. Pairs well with auto-record: set both once and every call just gets recorded.
 
