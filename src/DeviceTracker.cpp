@@ -76,11 +76,15 @@ static std::wstring ExeNameForPid(DWORD pid) {
     return name;
 }
 
-static bool IsKnownCallApp(const std::wstring& exe) {
-    for (const wchar_t* a : kCallApps)
-        if (exe == a) return true;
-    return false;
+// Index in kCallApps (dedicated apps first, browsers last), or -1.
+static int CallAppRank(const std::wstring& exe) {
+    int n = (int)(sizeof(kCallApps) / sizeof(kCallApps[0]));
+    for (int i = 0; i < n; i++)
+        if (exe == kCallApps[i]) return i;
+    return -1;
 }
+
+static bool IsKnownCallApp(const std::wstring& exe) { return CallAppRank(exe) >= 0; }
 
 // A session belonging to some process, with its owning device and peak level.
 struct SessionHit {
@@ -162,6 +166,15 @@ static std::vector<SessionHit> ScanSessions(IMMDeviceEnumerator* en, EDataFlow f
     return hits;
 }
 
+// With several call apps holding a mic (Zoom + a browser tab), prefer the
+// dedicated app so the pick doesn't flip between enumeration orders.
+static const SessionHit& BestHit(const std::vector<SessionHit>& hits) {
+    size_t best = 0;
+    for (size_t i = 1; i < hits.size(); i++)
+        if (CallAppRank(hits[i].exe) < CallAppRank(hits[best].exe)) best = i;
+    return hits[best];
+}
+
 static std::wstring DefaultCommDevice(IMMDeviceEnumerator* en, EDataFlow flow) {
     std::wstring result;
     IMMDevice* dev = nullptr;
@@ -192,9 +205,10 @@ DevicePick DeviceTracker::Pick() {
     // A call app actively using a mic is the strongest signal of a call.
     auto mics = ScanSessions(en, eCapture, L"", false);
     if (!mics.empty()) {
+        const SessionHit& best = BestHit(mics);
         p.tracked = true;
-        p.micId = mics[0].deviceId;
-        p.app = mics[0].exe;
+        p.micId = best.deviceId;
+        p.app = best.exe;
         // Prefer the render device the same app is playing through.
         auto rends = ScanSessions(en, eRender, p.app, false);
         if (!rends.empty()) p.renderId = rends[0].deviceId;
@@ -248,7 +262,7 @@ CallProbe DeviceTracker::Probe() {
     auto mics = ScanSessions(en, eCapture, L"", true);
     if (!mics.empty()) {
         c.micActive = true;
-        c.app = mics[0].exe;
+        c.app = BestHit(mics).exe;
         for (auto& h : mics)
             if (h.exe == c.app) c.micPeak = std::max(c.micPeak, h.peak);
 

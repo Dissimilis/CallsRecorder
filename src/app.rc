@@ -4,8 +4,8 @@
 1 24 "app.manifest" // 24 = RT_MANIFEST; the symbol itself may not resolve under windres
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,2,0,0
-PRODUCTVERSION  1,2,0,0
+FILEVERSION     1,2,1,0
+PRODUCTVERSION  1,2,1,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -14,11 +14,11 @@ BEGIN
     BLOCK "040904B0"
     BEGIN
       VALUE "FileDescription", "CallsRecorder - system tray call recorder"
-      VALUE "FileVersion", "1.2.0.0"
+      VALUE "FileVersion", "1.2.1.0"
       VALUE "InternalName", "CallsRecorder"
       VALUE "OriginalFilename", "CallsRecorder.exe"
       VALUE "ProductName", "CallsRecorder"
-      VALUE "ProductVersion", "1.2"
+      VALUE "ProductVersion", "1.2.1"
     END
   END
   BLOCK "VarFileInfo"

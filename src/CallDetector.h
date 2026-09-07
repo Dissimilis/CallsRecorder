@@ -42,8 +42,8 @@ public:
 
     Action tick(const Input& in);
 
-    // User asked to keep recording (balloon click / menu). Suppresses
-    // soft stops for tuning.extendMs.
+    // User asked to keep recording (balloon click / menu). Suppresses all
+    // automatic stops for tuning.extendMs.
     void extend(uint64_t nowMs);
 
     // Called by the UI when a recording is stopped manually, so we don't

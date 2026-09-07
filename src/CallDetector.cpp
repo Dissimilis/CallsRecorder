@@ -31,8 +31,11 @@ CallDetector::Action CallDetector::tick(const Input& in) {
     }
     if (!in.autoStarted) return Action::None; // manual recordings are the user's business
 
-    // Hard stop: the app let go of the mic and stayed away.
-    if (Since(micGoneSince_, !in.micActive, now) >= t_.hardStopMs) {
+    bool extended = extendUntil_ && now < extendUntil_;
+
+    // Hard stop: the app let go of the mic and stayed away. An explicit
+    // "keep recording" from the user overrides even this (headset dropouts).
+    if (Since(micGoneSince_, !in.micActive, now) >= t_.hardStopMs && !extended) {
         reset();
         reason_ = L"mic session gone";
         rearm_ = false; // mic already gone; next call may start at once
@@ -51,7 +54,6 @@ CallDetector::Action CallDetector::tick(const Input& in) {
     bool windowGone = Since(windowGoneSince_, in.meetingWindow == 0 && quiet, now) >= t_.windowGoneMs;
 
     bool looksOver = silentLong || windowGone;
-    bool extended = extendUntil_ && now < extendUntil_;
 
     if (promptAt_) {
         if (!looksOver) { promptAt_ = 0; reason_ = L"activity resumed"; return Action::CancelPrompt; }

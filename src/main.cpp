@@ -19,6 +19,8 @@ static const UINT WM_AUTOCMD = WM_APP + 2; // wParam: 1 = auto-start, 0 = auto-s
                                            //         2 = "meeting over?" prompt, 3 = cancel prompt
                                            // lParam: detector generation at decision time
 static const UINT kTimerId = 1;
+static const UINT kPromptTimerId = 2;   // balloon-shown confirmation deadline
+static const UINT kPromptConfirmMs = 5000;
 enum MenuId {
     kMenuStatus = 1, kMenuToggle, kMenuExtend, kMenuAuto, kMenuSplit, kMenuStartup,
     kMenuOpenFolder, kMenuChooseFolder, kMenuDebug, kMenuExit
@@ -36,6 +38,8 @@ static std::atomic<bool> g_watcherStop{false};
 static std::atomic<bool> g_autoEnabled{false};
 static std::atomic<bool> g_autoStartedRec{false};
 static std::atomic<bool> g_promptShown{false};
+static bool g_promptConfirmed = false;          // NIN_BALLOONSHOW arrived (UI thread only)
+static std::atomic<uint64_t> g_autoStartRetryAt{0}; // after a failed auto-start, wait before retrying
 static CallDetector g_detector; // ticked by the watcher thread; UI thread calls extend()/reset()
 static std::mutex g_detectorMtx;
 
@@ -116,6 +120,9 @@ static void StartRecording(bool autoStarted) {
         SetTimer(g_hwnd, kTimerId, 1000, nullptr);
         UpdateTrayIcon(false);
         LogLine(L"UI: recording started (%ls)", autoStarted ? L"auto" : L"manual");
+    } else if (autoStarted) {
+        g_autoStartRetryAt = GetTickCount64() + 60000; // don't hammer a broken device/disk
+        LogLine(L"UI: auto-start failed; retrying in 60 s");
     }
 }
 
@@ -151,12 +158,26 @@ static void ShowEndPrompt(bool show) {
     // Empty szInfo removes a balloon that is still showing.
     BOOL ok = Shell_NotifyIconW(NIM_MODIFY, &nid);
     g_promptShown = show && ok;
+    g_promptConfirmed = false;
+    KillTimer(g_hwnd, kPromptTimerId);
     LogLine(L"UI: meeting-over balloon %ls (ok=%d)", show ? L"shown" : L"dismissed", ok);
     if (show && !ok) {
         // Couldn't ask the user, so don't run the countdown either.
         LogLine(L"UI: balloon failed; keeping the recording");
         ExtendRecording();
+    } else if (show) {
+        // Success only means "queued": Focus Assist / Do Not Disturb (common
+        // while presenting) can swallow it. Require NIN_BALLOONSHOW.
+        SetTimer(g_hwnd, kPromptTimerId, kPromptConfirmMs, nullptr);
     }
+}
+
+// The user could not have seen the prompt; don't let the countdown run.
+static void PromptNotVisible(const wchar_t* why) {
+    KillTimer(g_hwnd, kPromptTimerId);
+    if (!g_promptShown || g_promptConfirmed) return;
+    LogLine(L"UI: balloon not visible (%ls); keeping the recording", why);
+    ExtendRecording();
 }
 
 static void ExtendRecording() {
@@ -245,7 +266,7 @@ static void AutoWatcher() {
         if (in.recording) { // recorder's own peak over the last ~2 s
             float lv[40];
             size_t n = g_recorder.levelHistory(lv, 40);
-            float mx = 0;
+            float mx = -1; // no samples yet -> unknown, not silent
             for (size_t i = 0; i < n; i++) mx = std::max(mx, lv[i]);
             in.recLevel = mx;
         }
@@ -274,6 +295,8 @@ static void AutoWatcher() {
                     c.renderActive, c.renderPeak, c.meetingWindow, in.recording,
                     in.recLevel, pending, name, decided ? L": " : L"", decided ? reason : L"");
         }
+        if (a == CallDetector::Action::Start && in.nowMs < g_autoStartRetryAt)
+            a = CallDetector::Action::None; // recent failed start; back off
         switch (a) {
             case CallDetector::Action::Start: PostMessageW(g_hwnd, WM_AUTOCMD, 1, (LPARAM)gen); break;
             case CallDetector::Action::Stop: PostMessageW(g_hwnd, WM_AUTOCMD, 0, (LPARAM)gen); break;
@@ -365,6 +388,10 @@ static void ShowMenu() {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_taskbarCreatedMsg) { // Explorer restarted; re-add our icon
         UpdateTrayIcon(true);
+        if (g_promptShown) { // any balloon died with the old taskbar
+            g_promptConfirmed = false;
+            PromptNotVisible(L"explorer restarted");
+        }
         return 0;
     }
     switch (msg) {
@@ -375,8 +402,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DoCommand(kMenuToggle);
             else if (LOWORD(lp) == NIN_BALLOONUSERCLICK)
                 ExtendRecording();
-            else if (LOWORD(lp) == NIN_BALLOONTIMEOUT)
+            else if (LOWORD(lp) == NIN_BALLOONSHOW) {
+                g_promptConfirmed = true;
+                KillTimer(g_hwnd, kPromptTimerId);
+            } else if (LOWORD(lp) == NIN_BALLOONTIMEOUT || LOWORD(lp) == NIN_BALLOONHIDE) {
+                // Timeout/hide before a show = suppressed (quiet hours etc.).
+                if (!g_promptConfirmed) PromptNotVisible(L"hidden before shown");
                 g_promptShown = false;
+            }
             return 0;
         case WM_COMMAND:
             DoCommand(LOWORD(wp));
@@ -404,6 +437,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER:
+            if (wp == kPromptTimerId) {
+                PromptNotVisible(L"no show notification");
+                return 0;
+            }
             if (wp == kTimerId) {
                 // Recorder thread may have died (e.g. disk full) — reflect it.
                 if (!g_recorder.recording()) {
